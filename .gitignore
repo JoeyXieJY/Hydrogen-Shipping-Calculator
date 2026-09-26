@@ -1,0 +1,28 @@
+# Python virtual environments and caches
+.venv/
+venv/
+__pycache__/
+*.py[cod]
+
+# Local secrets and credentials
+.env
+.env.*
+*.pem
+*.key
+*.pfx
+*.p12
+credentials.*
+secrets.toml
+.streamlit/secrets.toml
+
+# Original spreadsheet source files
+*.xlsx
+*.xls
+*.xlsm
+*.xlsb
+
+# Editor and operating-system files
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
