@@ -7,15 +7,15 @@
 ```text
 请先阅读 README.md、app.py、model.py 和 test_model.py。
 这是一个面向Python初学者的Streamlit项目。
-所有网页修改放在app.py，所有工程计算放在model.py。
-修改后必须运行：python -m unittest test_model.py -v
+所有网页修改放在app.py，所有工程计算放在model.py，参数及来源放在model_data.json。
+修改后必须运行：python -m pytest -q
 不要增加React、Flask、JavaScript或数据库。
 ```
 
 ## 2. 让 Codex 修改页面
 
 ```text
-请修改 app.py：保留顶部导航、左侧全部输入、右侧3个指标卡和2张图表。
+请修改 app.py：保留顶部名称、左侧输入和右侧结果区。
 页面保持白色背景和绿色主题，不要增加新的页面或复杂功能。
 完成后检查Python语法，不要修改model.py。
 ```
@@ -43,21 +43,22 @@ CSV包含carrier、annual cost、delivered quantity和AUD/kg H2。
 要求 Codex 运行：
 
 ```bash
-python -m py_compile app.py model.py test_model.py
+python -m compileall .
+python -m pytest -q
 python -m unittest test_model.py -v
 ```
 
 如果修改了网页，自己再运行：
 
 ```bash
-streamlit run app.py
+python -m streamlit run app.py
 ```
 
 然后在浏览器中检查：
 
 - 输入框是否完整；
-- 点击 Run model 后数字是否更新；
-- 两张图表是否显示；
+- 点击 Calculate 后数字是否更新；
+- 成本、排放和敏感性图表是否显示；
 - 页面在缩小浏览器窗口后是否仍能使用；
 - 不应出现红色错误提示。
 

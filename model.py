@@ -1,210 +1,390 @@
-"""Pure-Python port of the active HySupply shipping calculations.
+"""Auditable shipping-cost, mass-balance and transport-chain emissions model.
 
-The workbook is treated as the audit reference. This module has no Excel or
-web-framework dependency, which makes the model testable and easy to extend.
-All monetary build-up values are in million USD/year until presentation.
+The calculation layer is intentionally independent of Streamlit. Monetary
+components are stored as million USD/year and converted only for presentation.
 """
 from __future__ import annotations
 
 import copy
 import json
+import math
 from pathlib import Path
 from typing import Any
 
 
 DATA_PATH = Path(__file__).with_name("model_data.json")
 REFERENCE = json.loads(DATA_PATH.read_text(encoding="utf-8"))
+KNOT_TO_KM_PER_HOUR = 1.852
+GWP100_CH4 = 28.0
+GWP100_N2O = 265.0
 
 
 def _num(value: Any, name: str, low: float | None = None, high: float | None = None) -> float:
     try:
         number = float(value)
     except (TypeError, ValueError) as exc:
-        raise ValueError(f"{name} 必须是数字") from exc
+        raise ValueError(f"{name} must be numeric") from exc
+    if not math.isfinite(number):
+        raise ValueError(f"{name} must be finite")
     if low is not None and number < low:
-        raise ValueError(f"{name} 不能小于 {low}")
+        raise ValueError(f"{name} cannot be below {low}")
     if high is not None and number > high:
-        raise ValueError(f"{name} 不能大于 {high}")
+        raise ValueError(f"{name} cannot exceed {high}")
     return number
 
 
 def capital_recovery_factor(rate_pct: float, years: float) -> float:
     rate = rate_pct / 100.0
     if years <= 0:
-        raise ValueError("经济寿命必须大于 0")
+        raise ValueError("Economic life must be greater than zero")
     if rate == 0:
         return 1.0 / years
     return rate * (1 + rate) ** years / ((1 + rate) ** years - 1)
 
 
-def _route_value(table: str, departure: str, arrival: str, custom: Any) -> Any:
-    if departure == "Custom" or arrival == "Custom":
-        return custom
-    try:
-        return REFERENCE["routes"][table][departure][arrival]
-    except KeyError as exc:
-        raise ValueError("未找到所选港口组合的航线数据") from exc
+def exponential_remaining(initial_mass: float, rate_pct_day: float, days: float) -> float:
+    """Return remaining mass after a discrete daily loss rate."""
+    if initial_mass < 0 or days < 0 or not 0 <= rate_pct_day <= 100:
+        raise ValueError("Invalid mass, duration or daily loss rate")
+    return initial_mass * (1.0 - rate_pct_day / 100.0) ** days
 
 
-def _carrier_result(name: str, p: dict[str, Any], carrier: dict[str, Any], route: dict[str, Any]) -> dict[str, Any]:
+def _deep_update(base: dict[str, Any], updates: dict[str, Any]) -> dict[str, Any]:
+    result = copy.deepcopy(base)
+    for key, value in updates.items():
+        if isinstance(value, dict) and isinstance(result.get(key), dict):
+            result[key] = _deep_update(result[key], value)
+        else:
+            result[key] = value
+    return result
+
+
+def _validated_inputs(payload: dict[str, Any] | None) -> tuple[dict[str, Any], dict[str, dict[str, Any]]]:
+    payload = copy.deepcopy(payload or {})
+    overrides = payload.pop("carrier_overrides", {})
+    raw = {**REFERENCE["workbook_case"], **payload}
+    route = REFERENCE["route"]
+    for key, expected in (("departure", route["departure"]), ("arrival", route["arrival"]), ("route", route["name"])):
+        if key in raw and raw[key] != expected:
+            raise ValueError(f"{key} is fixed to {expected}")
+
+    bounds = {
+        "aud_usd": (0.01, None), "interest_rate_pct": (0, 100),
+        "economic_life_years": (1, 100), "fuel_cost_usd_tonne": (0, None),
+        "voyage_time_adjustment_factor": (1.0, 3.0), "operating_days_year": (0.1, 366),
+        "maintenance_pct_capex": (0, 100), "misc_pct_opex": (0, 100),
+        "insurance_pct_opex": (0, 100), "labour_musd_year": (0, None),
+        "carbon_price_usd_tonne": (0, None), "port_days_each_end": (0, 100),
+        "port_charge_musd_day": (0, None), "export_storage_days": (0, 365),
+        "import_storage_days": (0, 365), "cracker_conversion_pct": (0, 100),
+        "psa_recovery_pct": (0, 100), "cracking_cost_usd_per_kg_h2": (0, None),
+        "queensland_grid_kgco2e_kwh": (0, None), "japan_grid_kgco2e_kwh": (0, None),
+        "hydrogen_gwp100": (0, None), "ammonia_engine_n2o_gco2e_mj": (0, None),
+        "cracking_electricity_kwh_kg_h2": (0, None),
+        "cracking_thermal_kwhth_kg_h2": (0, None), "heater_efficiency_pct": (0.01, 100)
+    }
+    p = copy.deepcopy(raw)
+    for field, (low, high) in bounds.items():
+        p[field] = _num(raw[field], field, low, high)
+    p["include_h2_leakage_in_carbon_cost"] = bool(raw["include_h2_leakage_in_carbon_cost"])
+    if p["cracking_heat_source"] not in {"Electric heating", "Process hydrogen/off-gas", "Natural gas"}:
+        raise ValueError("Unsupported cracking heat source")
+
+    carrier_data: dict[str, dict[str, Any]] = {}
+    for name, defaults in REFERENCE["carrier_defaults"].items():
+        carrier_data[name] = _deep_update(defaults, overrides.get(name, {}))
+        c = carrier_data[name]
+        positive = ["lhv_mj_kg", "density_kg_m3", "ship_capacity_m3", "engine_mw", "engine_efficiency_pct"]
+        for field in positive:
+            c[field] = _num(c[field], f"{name}.{field}", 0.000001)
+        for field in ["transport_bog_pct_day", "storage_bog_pct_day", "fill_fraction_pct", "heel_fraction_pct", "bog_managed_pct", "bog_vented_pct"]:
+            c[field] = _num(c[field], f"{name}.{field}", 0, 100)
+        if c["fill_fraction_pct"] <= c["heel_fraction_pct"]:
+            raise ValueError(f"{name}: fill fraction must be greater than heel fraction")
+        if not math.isclose(c["bog_managed_pct"] + c["bog_vented_pct"], 100.0, abs_tol=1e-9):
+            raise ValueError(f"{name}: BOG managed and vented fractions must total 100%")
+    return p, carrier_data
+
+
+def _route(p: dict[str, Any]) -> dict[str, Any]:
+    data = REFERENCE["route"]
+    base_days = data["distance_km"] / (data["reference_speed_knots"] * KNOT_TO_KM_PER_HOUR * 24.0)
+    return {
+        **data,
+        "calculated_one_way_days": base_days,
+        "voyage_time_adjustment_factor": p["voyage_time_adjustment_factor"],
+        "one_way_days": base_days * p["voyage_time_adjustment_factor"],
+    }
+
+
+def _fuel_combustion_emissions_tonnes(fuel_name: str, fuel_kg: float, fuel_energy_mj: float, p: dict[str, Any]) -> float:
+    props = REFERENCE["fuel_properties"][fuel_name]
+    co2 = fuel_kg / 1000.0 * props["co2_t_per_t"]
+    ch4_co2e = fuel_kg * props.get("ch4_g_per_kg", 0.0) * GWP100_CH4 / 1_000_000.0
+    n2o_co2e = fuel_kg * props.get("n2o_g_per_kg", 0.0) * GWP100_N2O / 1_000_000.0
+    if fuel_name == "Ammonia":
+        n2o_co2e = fuel_energy_mj * p["ammonia_engine_n2o_gco2e_mj"] / 1_000_000.0
+    return co2 + ch4_co2e + n2o_co2e
+
+
+def _carrier_result(name: str, p: dict[str, Any], c: dict[str, Any], route: dict[str, Any]) -> dict[str, Any]:
     crf = capital_recovery_factor(p["interest_rate_pct"], p["economic_life_years"])
-    trip_days = route["one_way_days"] * 2 + p["port_days_each_end"] * 2
+    voyage_days = route["one_way_days"]
+    trip_days = 2.0 * voyage_days + 2.0 * p["port_days_each_end"]
     trips = p["operating_days_year"] / trip_days
-    sailing_days = trips * route["one_way_days"] * 2
 
-    nominal_capacity = 2 * carrier["ship_capacity_m3"]
-    export_storage_capex = round(
-        carrier["export_reference_cost_musd"]
-        * (nominal_capacity / carrier["export_reference_capacity_m3"]) ** carrier["export_scale_coefficient"], 2
-    )
-    import_storage_capex = round(
-        carrier["import_reference_cost_musd"]
-        * (nominal_capacity / carrier["import_reference_capacity_m3"]) ** carrier["import_scale_coefficient"], 2
-    )
+    nominal_mass = c["ship_capacity_m3"] * c["density_kg_m3"]
+    departure_mass = nominal_mass * c["fill_fraction_pct"] / 100.0
+    target_heel = nominal_mass * c["heel_fraction_pct"] / 100.0
 
-    ship_capital = crf * carrier["ship_capex_musd"]
+    export_after_fraction = (1.0 - c["storage_bog_pct_day"] / 100.0) ** p["export_storage_days"]
+    if export_after_fraction <= 0:
+        raise ValueError(f"{name}: export storage loss leaves no cargo")
+    export_feed = departure_mass / export_after_fraction
+    export_storage_loss = export_feed - departure_mass
+
+    mass_after_outbound_bog = exponential_remaining(departure_mass, c["transport_bog_pct_day"], voyage_days)
+    outbound_bog = departure_mass - mass_after_outbound_bog
+
+    input_energy_mj_day = c["engine_mw"] * 24.0 * 3600.0 / (c["engine_efficiency_pct"] / 100.0)
+    fuel_lhv = REFERENCE["fuel_properties"][c["ship_fuel_source"]]["lhv_mj_kg"]
+    fuel_demand_leg = input_energy_mj_day * voyage_days / fuel_lhv
+    managed_outbound_bog = outbound_bog * c["bog_managed_pct"] / 100.0
+    fuel_from_outbound_bog = min(managed_outbound_bog, fuel_demand_leg)
+    outbound_fuel_gap = fuel_demand_leg - fuel_from_outbound_bog
+    # The remaining propulsion demand is treated as separately bunkered fuel.
+    # It is priced and emitted, but is not deducted from the cargo a second time.
+    arrival_mass = mass_after_outbound_bog
+    if arrival_mass <= target_heel:
+        raise ValueError(f"{name}: arrival mass does not exceed the target heel")
+    unloaded_mass = arrival_mass - target_heel
+
+    heel_after_return_bog = exponential_remaining(target_heel, c["transport_bog_pct_day"], voyage_days)
+    return_heel_bog = target_heel - heel_after_return_bog
+    managed_return_bog = return_heel_bog * c["bog_managed_pct"] / 100.0
+    fuel_from_return_bog = min(managed_return_bog, fuel_demand_leg)
+    return_fuel_gap = fuel_demand_leg - fuel_from_return_bog
+    heel_after_return = heel_after_return_bog
+    heel_makeup = target_heel - heel_after_return
+
+    usable_medium_trip = exponential_remaining(unloaded_mass, c["storage_bog_pct_day"], p["import_storage_days"])
+    import_storage_loss = unloaded_mass - usable_medium_trip
+
+    export_feed_year = export_feed * trips
+    departure_mass_year = departure_mass * trips
+    unloaded_mass_year = unloaded_mass * trips
+    usable_medium_year = usable_medium_trip * trips
+    outbound_bog_year = outbound_bog * trips
+    return_bog_year = return_heel_bog * trips
+    export_storage_loss_year = export_storage_loss * trips
+    import_storage_loss_year = import_storage_loss * trips
+    heel_makeup_year = heel_makeup * trips
+    fuel_required_year = 2.0 * fuel_demand_leg * trips
+    fuel_gap_year = (outbound_fuel_gap + return_fuel_gap) * trips
+
+    average_export_daily = export_feed_year / p["operating_days_year"]
+    average_import_daily = unloaded_mass_year / p["operating_days_year"]
+    export_storage_mass = max(departure_mass, average_export_daily * p["export_storage_days"])
+    import_storage_mass = max(unloaded_mass, average_import_daily * p["import_storage_days"])
+    export_storage_m3 = export_storage_mass / c["density_kg_m3"]
+    import_storage_m3 = import_storage_mass / c["density_kg_m3"]
+    export_storage_capex = c["export_reference_cost_musd"] * (export_storage_m3 / c["export_reference_capacity_m3"]) ** c["export_scale_coefficient"]
+    import_storage_capex = c["import_reference_cost_musd"] * (import_storage_m3 / c["import_reference_capacity_m3"]) ** c["import_scale_coefficient"]
+
+    theoretical_h2_year = usable_medium_year * c["theoretical_h2_kg_per_kg"]
+    recovered_h2_year = theoretical_h2_year
+    cracking_h2_energy_use = 0.0
+    cracking_natural_gas_kg = 0.0
+    cracking_electricity_kwh = 0.0
+    if name == "Ammonia":
+        recovered_h2_year *= p["cracker_conversion_pct"] / 100.0 * p["psa_recovery_pct"] / 100.0
+        cracking_electricity_kwh = recovered_h2_year * p["cracking_electricity_kwh_kg_h2"]
+        thermal_kwh = recovered_h2_year * p["cracking_thermal_kwhth_kg_h2"]
+        if p["cracking_heat_source"] == "Electric heating":
+            cracking_electricity_kwh += thermal_kwh / (p["heater_efficiency_pct"] / 100.0)
+        elif p["cracking_heat_source"] == "Process hydrogen/off-gas":
+            cracking_h2_energy_use = thermal_kwh * 3.6 / REFERENCE["fuel_properties"]["Hydrogen"]["lhv_mj_kg"]
+        else:
+            cracking_natural_gas_kg = thermal_kwh * 3.6 / REFERENCE["fuel_properties"]["Natural gas"]["lhv_mj_kg"]
+    delivered_h2_year = recovered_h2_year - cracking_h2_energy_use
+    if min(usable_medium_year, theoretical_h2_year, recovered_h2_year, delivered_h2_year) <= 0:
+        raise ValueError(f"{name}: calculated delivery is not positive")
+
+    export_terminal_kwh = export_feed_year * c["terminal_electricity_kwh_kg"]
+    import_terminal_kwh = unloaded_mass_year * c["import_terminal_electricity_kwh_kg"]
+    export_emissions = export_terminal_kwh * p["queensland_grid_kgco2e_kwh"] / 1000.0
+    import_emissions = import_terminal_kwh * p["japan_grid_kgco2e_kwh"] / 1000.0
+    fuel_energy_year_mj = fuel_required_year * fuel_lhv
+    shipping_emissions = _fuel_combustion_emissions_tonnes(c["ship_fuel_source"], fuel_required_year, fuel_energy_year_mj, p)
+    cracking_emissions = cracking_electricity_kwh * p["japan_grid_kgco2e_kwh"] / 1000.0
+    cracking_emissions += cracking_natural_gas_kg / 1000.0 * REFERENCE["fuel_properties"]["Natural gas"]["co2_t_per_t"]
+    transport_chain_emissions = export_emissions + shipping_emissions + import_emissions + cracking_emissions
+    shipping_chain_emissions = export_emissions + shipping_emissions + import_emissions
+
+    vented_transport = (outbound_bog_year + return_bog_year) * c["bog_vented_pct"] / 100.0
+    leaked_h2 = 0.0
+    if name == "Hydrogen":
+        leaked_h2 = vented_transport + export_storage_loss_year + import_storage_loss_year
+    h2_leakage_tco2e = leaked_h2 * p["hydrogen_gwp100"] / 1000.0
+    nh3_slip_kg = fuel_required_year * c.get("nh3_slip_pct_fuel", 0.0) / 100.0 if name == "Ammonia" else 0.0
+
+    ship_capital = crf * c["ship_capex_musd"]
     storage_capital = crf * (export_storage_capex + import_storage_capex)
-    additional_capital = crf * carrier["additional_capex_musd"]
+    additional_capital = crf * c["additional_capex_musd"]
+    maintenance = p["maintenance_pct_capex"] / 100.0 * c["ship_capex_musd"]
+    storage_opex = c["import_om_pct"] / 100.0 * import_storage_capex + c["export_om_pct"] / 100.0 * export_storage_capex
+    port = p["port_charge_musd_day"] * p["port_days_each_end"] * trips * 2.0
+    base_opex = p["labour_musd_year"] + port + maintenance + storage_opex + c["additional_opex_musd_year"]
+    miscellaneous = base_opex * p["misc_pct_opex"] / 100.0
+    insurance = base_opex * p["insurance_pct_opex"] / 100.0
+    fuel_cost = fuel_gap_year * c["lhv_mj_kg"] / 1000.0 * c["market_price_usd_gj"] / 1_000_000.0
+    shipping_bog_cost = (outbound_bog_year + return_bog_year) * c["lhv_mj_kg"] / 1000.0 * c["market_price_usd_gj"] / 1_000_000.0
+    storage_bog_cost = (export_storage_loss_year + import_storage_loss_year) * c["lhv_mj_kg"] / 1000.0 * c["market_price_usd_gj"] / 1_000_000.0
+    carbon_base = shipping_chain_emissions
+    if p["include_h2_leakage_in_carbon_cost"]:
+        carbon_base += h2_leakage_tco2e
+    shipping_carbon_cost = carbon_base * p["carbon_price_usd_tonne"] / 1_000_000.0
 
-    energy_mwh_day = round(carrier["engine_mw"] * 24 / (carrier["engine_efficiency_pct"] / 100), 2)
-    fuel_lhv = REFERENCE["fuel_properties"][carrier["ship_fuel_source"]]["lhv_mj_kg"]
-    fuel_use_t_day = round(energy_mwh_day * 3.6 / fuel_lhv, 2)
-    required_fuel = fuel_use_t_day * sailing_days
-
-    transport_bog = carrier["transport_bog_pct_day"] / 100 * carrier["ship_capacity_kg"] * sailing_days / 1000
-    fuel_source = carrier["ship_fuel_source"]
-    fossil_fuels = {"Heavy Fuel Oil (HFO)", "Marine Gas Oil (MGO)", "Very Low Sulfur Fuel Oil (VLSFO)", "Custom"}
-    if fuel_source in fossil_fuels:
-        forced_bog = 0.0
-    elif fuel_source == name or (name == "Ammonia" and fuel_source == "Hydrogen"):
-        required_medium = required_fuel / carrier["mass_conversion_s1_kg_h2_per_kg"] if name == "Ammonia" else required_fuel
-        forced_bog = max(required_medium - transport_bog, 0.0)
-    else:
-        forced_bog = 0.0
-    total_bog = transport_bog + forced_bog if forced_bog > 0 else transport_bog
-    bog_per_trip = total_bog / trips
-
-    export_storage_bog = carrier["export_bog_pct_day"] / 100 * nominal_capacity / 2 * carrier["density_kg_m3"] * 365 / 1000
-    import_storage_bog = carrier["import_bog_pct_day"] / 100 * nominal_capacity / 2 * carrier["density_kg_m3"] * 365 / 1000
-
-    suez_cost = p["suez_cost_musd_one_way"] if route["suez"] == "YES" else 0.0
-    panama_cost = p["panama_cost_musd_one_way"] if route["panama"] == "YES" else 0.0
-    labour = p["labour_musd_year"]
-    canal = (suez_cost + panama_cost) * 2 * trips
-    port = p["port_charge_musd_day"] * p["port_days_each_end"] * trips * 2
-    maintenance = p["maintenance_pct_capex"] / 100 * carrier["ship_capex_musd"]
-    storage_opex = carrier["import_om_pct"] / 100 * import_storage_capex + carrier["export_om_pct"] / 100 * export_storage_capex
-    base_opex = labour + canal + port + maintenance + storage_opex + carrier["additional_opex_musd_year"]
-    miscellaneous = base_opex * p["misc_pct_opex"] / 100
-    insurance = base_opex * p["insurance_pct_opex"] / 100
-
-    if fuel_source in {"Hydrogen", "Ammonia"}:
-        fuel_cost = carrier["market_price_usd_gj"] * total_bog * carrier["lhv_mj_kg"] / 1_000_000
-    else:
-        fuel_cost = required_fuel * p["fuel_cost_usd_tonne"] / 1_000_000
-    emission_factor = REFERENCE["fuel_properties"][fuel_source]["co2_t_per_t"]
-    emissions = (total_bog if fuel_source == name and name == "Hydrogen" else required_fuel) * emission_factor
-    carbon_cost = emissions * p["carbon_price_usd_tonne"] / 1_000_000
-    shipping_bog_cost = 0.0 if fuel_source in {"Hydrogen", "Ammonia"} else carrier["market_price_usd_gj"] * transport_bog * carrier["lhv_mj_kg"] / 1_000_000
-    storage_bog_cost = carrier["market_price_usd_gj"] * (export_storage_bog + import_storage_bog) * carrier["lhv_mj_kg"] / 1_000_000
-
-    components = {
-        "Ship CAPEX": ship_capital,
-        "Storage CAPEX": storage_capital,
-        "Additional CAPEX": additional_capital,
-        "Labour": labour,
-        "Canal": canal,
-        "Port": port,
-        "Maintenance": maintenance,
-        "Miscellaneous": miscellaneous,
-        "Insurance": insurance,
-        "Storage OPEX": storage_opex,
-        "Additional OPEX": carrier["additional_opex_musd_year"],
-        "Fuel": fuel_cost,
-        "Carbon": carbon_cost,
-        "Shipping BOG": shipping_bog_cost,
+    shipping_components = {
+        "Ship CAPEX": ship_capital, "Storage CAPEX": storage_capital,
+        "Additional CAPEX": additional_capital, "Labour": p["labour_musd_year"],
+        "Port": port, "Maintenance": maintenance, "Miscellaneous": miscellaneous,
+        "Insurance": insurance, "Storage OPEX": storage_opex,
+        "Additional OPEX": c["additional_opex_musd_year"], "Fuel": fuel_cost,
+        "Carbon": shipping_carbon_cost, "Shipping BOG": shipping_bog_cost,
         "Storage BOG": storage_bog_cost,
     }
-    total_annual = sum(components.values())
-    delivered_medium_kg = (carrier["ship_capacity_kg"] - bog_per_trip * 1000) * trips
-    delivered_h2e_graph_kg = delivered_medium_kg * carrier["graph_h2_conversion"]
-    delivered_energy_gj = delivered_medium_kg * carrier["lhv_mj_kg"] / 1000
-    if min(delivered_medium_kg, delivered_h2e_graph_kg, delivered_energy_gj) <= 0:
-        raise ValueError(f"{name} 的损耗超过运载量；请检查航程、BOG 和运营天数")
+    landed_components = copy.deepcopy(shipping_components)
+    if name == "Ammonia":
+        landed_components["Ammonia cracking"] = recovered_h2_year * p["cracking_cost_usd_per_kg_h2"] / 1_000_000.0
+        landed_components["Cracking carbon"] = cracking_emissions * p["carbon_price_usd_tonne"] / 1_000_000.0
 
-    aud_factor = 1 / p["aud_usd"]
-    per_kg_h2 = {key: value * 1_000_000 / delivered_h2e_graph_kg * aud_factor for key, value in components.items()}
-    per_tonne_medium = {key: value * 1_000_000 / delivered_medium_kg * 1000 * aud_factor for key, value in components.items()}
-    per_gj_medium = {key: value * 1_000_000 / delivered_energy_gj * aud_factor for key, value in components.items()}
+    shipping_total = sum(shipping_components.values())
+    landed_total = sum(landed_components.values())
+    aud_per_usd = 1.0 / p["aud_usd"]
+    shipping_per_kg_h2 = shipping_total * 1_000_000.0 / theoretical_h2_year * aud_per_usd
+    landed_per_kg_h2 = landed_total * 1_000_000.0 / delivered_h2_year * aud_per_usd
+    shipping_breakdown = {k: v * 1_000_000.0 / theoretical_h2_year * aud_per_usd for k, v in shipping_components.items()}
+    landed_breakdown = {k: v * 1_000_000.0 / delivered_h2_year * aud_per_usd for k, v in landed_components.items()}
+
     return {
         "carrier": name,
         "route": route,
         "operations": {
-            "trip_days": trip_days,
-            "trips_per_year": trips,
-            "sailing_days": sailing_days,
-            "fuel_use_tonnes_year": required_fuel,
-            "transport_bog_tonnes_year": transport_bog,
-            "total_bog_tonnes_year": total_bog,
+            "trip_days": trip_days, "trips_per_year": trips,
+            "sailing_days": trips * voyage_days * 2.0,
+            "fuel_required_kg_year": fuel_required_year, "fuel_gap_kg_year": fuel_gap_year,
+            "outbound_bog_kg_year": outbound_bog_year, "return_heel_bog_kg_year": return_bog_year,
+            "heel_makeup_kg_year": heel_makeup_year,
         },
-        "annual_musd": components,
+        "mass_balance_per_trip_kg": {
+            "nominal_mass": nominal_mass, "departure_mass": departure_mass,
+            "export_feed": export_feed, "export_storage_loss": export_storage_loss,
+            "outbound_bog": outbound_bog, "outbound_fuel_gap": outbound_fuel_gap,
+            "arrival_mass": arrival_mass, "target_heel": target_heel,
+            "unloaded_mass": unloaded_mass, "import_storage_loss": import_storage_loss,
+            "usable_medium": usable_medium_trip, "return_heel_bog": return_heel_bog,
+            "heel_after_return": heel_after_return, "heel_makeup": heel_makeup,
+        },
+        "storage": {
+            "export_required_mass_kg": export_storage_mass, "import_required_mass_kg": import_storage_mass,
+            "export_required_m3": export_storage_m3, "import_required_m3": import_storage_m3,
+            "export_capex_musd": export_storage_capex, "import_capex_musd": import_storage_capex,
+        },
+        "annual_musd": landed_components,
+        "annual_musd_shipping": shipping_components,
         "totals": {
             "capital_musd_year": ship_capital + storage_capital + additional_capital,
-            "operating_musd_year": total_annual - ship_capital - storage_capital - additional_capital,
-            "total_musd_year": total_annual,
-            "delivered_medium_kg_year": delivered_medium_kg,
-            "delivered_h2e_graph_kg_year": delivered_h2e_graph_kg,
-            "delivered_energy_gj_year": delivered_energy_gj,
-            "aud_per_kg_h2_graph": sum(per_kg_h2.values()),
-            "aud_per_tonne_medium": sum(per_tonne_medium.values()),
-            "aud_per_gj_medium": sum(per_gj_medium.values()),
+            "shipping_total_musd_year": shipping_total, "landed_total_musd_year": landed_total,
+            "delivered_medium_kg_year": usable_medium_year,
+            "theoretical_h2_kg_year": theoretical_h2_year,
+            "recovered_h2_kg_year": recovered_h2_year, "delivered_h2_kg_year": delivered_h2_year,
+            "shipping_cost_aud_per_kg_h2": shipping_per_kg_h2,
+            "landed_cost_aud_per_kg_h2": landed_per_kg_h2,
+            "aud_per_kg_h2_graph": shipping_per_kg_h2,
+            "delivered_energy_gj_year": usable_medium_year * c["lhv_mj_kg"] / 1000.0,
+            "aud_per_tonne_medium": shipping_total * 1_000_000.0 / usable_medium_year * 1000.0 * aud_per_usd,
+            "aud_per_gj_medium": shipping_total * 1_000_000.0 / (usable_medium_year * c["lhv_mj_kg"] / 1000.0) * aud_per_usd,
+            "transport_chain_emissions_tco2e_year": transport_chain_emissions,
+            "emissions_kgco2e_per_kg_delivered_h2": transport_chain_emissions * 1000.0 / delivered_h2_year,
+            "supplementary_h2_leakage_tco2e_year": h2_leakage_tco2e,
+            "nh3_slip_kg_year": nh3_slip_kg,
+        },
+        "emissions_breakdown_tco2e": {
+            "Export terminal": export_emissions, "Shipping": shipping_emissions,
+            "Import terminal": import_emissions, "Ammonia cracking": cracking_emissions,
         },
         "breakdown": {
-            "aud_per_kg_h2_graph": per_kg_h2,
-            "aud_per_tonne_medium": per_tonne_medium,
-            "aud_per_gj_medium": per_gj_medium,
+            "shipping_aud_per_kg_h2": shipping_breakdown,
+            "landed_aud_per_kg_h2": landed_breakdown,
+            "aud_per_kg_h2_graph": shipping_breakdown,
         },
     }
 
 
 def calculate_case(payload: dict[str, Any] | None = None) -> dict[str, Any]:
-    raw = {**REFERENCE["workbook_case"], **(payload or {})}
-    numeric_fields = {
-        "aud_usd": (0.01, None), "interest_rate_pct": (0, 100), "economic_life_years": (1, 100),
-        "fuel_cost_usd_tonne": (0, None), "ship_speed_knots": (0.1, 100), "operating_days_year": (0.1, 366),
-        "maintenance_pct_capex": (0, 100), "misc_pct_opex": (0, 100), "insurance_pct_opex": (0, 100),
-        "labour_musd_year": (0, None), "carbon_price_usd_tonne": (0, None), "suez_cost_musd_one_way": (0, None),
-        "panama_cost_musd_one_way": (0, None), "port_days_each_end": (0, 100), "port_charge_musd_day": (0, None),
+    p, carriers = _validated_inputs(payload)
+    route = _route(p)
+    requested = (payload or {}).get("carriers", list(carriers))
+    if not isinstance(requested, list) or not requested:
+        raise ValueError("Select at least one carrier")
+    if any(name not in carriers for name in requested):
+        raise ValueError("Only Ammonia and Hydrogen are supported")
+    results = [_carrier_result(name, p, carriers[name], route) for name in requested]
+    return {
+        "inputs": p, "results": results, "currency": "AUD",
+        "model_version": REFERENCE["model_version"],
+        "scope": "Australian export terminal to Japanese import terminal and ammonia cracking; production excluded",
     }
-    p = copy.deepcopy(raw)
-    for field, (low, high) in numeric_fields.items():
-        p[field] = _num(raw[field], field, low, high)
 
-    departure, arrival = str(raw["departure"]), str(raw["arrival"])
-    custom_distance = _num(raw.get("custom_distance_nm", raw.get("distance_nm", 3619)), "custom_distance_nm", 1)
-    distance = _num(_route_value("distance_nm", departure, arrival, custom_distance), "distance_nm", 1)
-    suez = str(_route_value("suez", departure, arrival, raw.get("custom_suez", "NO"))).upper()
-    panama = str(_route_value("panama", departure, arrival, raw.get("custom_panama", "NO"))).upper()
-    calculated_days = distance / (p["ship_speed_knots"] * 24)
-    override = raw.get("one_way_days")
-    one_way_days = _num(override, "one_way_days", 0.01) if override not in (None, "", 0, "0") else calculated_days
-    route = {"departure": departure, "arrival": arrival, "distance_nm": distance, "suez": suez, "panama": panama,
-             "one_way_days": one_way_days, "calculated_days": calculated_days, "days_overridden": override not in (None, "", 0, "0")}
 
-    names = raw.get("carriers", ["Ammonia", "Hydrogen"])
-    if not isinstance(names, list) or not names:
-        raise ValueError("至少选择一种运输介质")
-    results = []
-    for name in names:
-        if name not in REFERENCE["carrier_defaults"]:
-            raise ValueError(f"当前版本尚未配置运输介质：{name}")
-        results.append(_carrier_result(name, p, copy.deepcopy(REFERENCE["carrier_defaults"][name]), route))
-    return {"inputs": p, "results": results, "currency": "AUD", "model_version": "1.0.0-web-port"}
+def sensitivity_analysis(payload: dict[str, Any] | None = None, carrier: str = "Ammonia") -> list[dict[str, Any]]:
+    """Run one-at-a-time low/base/high scenarios through the core model."""
+    if carrier not in REFERENCE["carrier_defaults"]:
+        raise ValueError("Unsupported carrier for sensitivity analysis")
+    base_payload = copy.deepcopy(payload or {})
+    base_payload["carriers"] = [carrier]
+    base_result = calculate_case(base_payload)["results"][0]
+    specs = list(REFERENCE["sensitivity_parameters"])
+    specs.extend(REFERENCE.get("carrier_sensitivity_parameters", {}).get(carrier, []))
+    if carrier == "Hydrogen":
+        excluded = {"cracker_conversion_pct", "psa_recovery_pct", "cracking_cost_usd_per_kg_h2", "ammonia_engine_n2o_gco2e_mj", "cracking_electricity_kwh_kg_h2", "cracking_thermal_kwhth_kg_h2", "heater_efficiency_pct"}
+        specs = [spec for spec in specs if spec["key"] not in excluded]
+    rows: list[dict[str, Any]] = []
+    for spec in specs:
+        outcomes: dict[str, dict[str, float]] = {}
+        for level, value in (("Low", spec["low"]), ("High", spec["high"])):
+            scenario = copy.deepcopy(base_payload)
+            if spec.get("carrier_field"):
+                scenario.setdefault("carrier_overrides", {}).setdefault(carrier, {})[spec["carrier_field"]] = value
+            else:
+                scenario[spec["key"]] = value
+            result = calculate_case(scenario)["results"][0]["totals"]
+            outcomes[level] = {
+                "shipping": result["shipping_cost_aud_per_kg_h2"],
+                "landed": result["landed_cost_aud_per_kg_h2"],
+                "delivered": result["delivered_h2_kg_year"],
+                "emissions": result["transport_chain_emissions_tco2e_year"],
+            }
+        totals = base_result["totals"]
+        rows.append({
+            "Parameter": spec["label"], "Low input": spec["low"], "Base input": spec["base"], "High input": spec["high"],
+            "Low shipping cost": outcomes["Low"]["shipping"], "Base shipping cost": totals["shipping_cost_aud_per_kg_h2"], "High shipping cost": outcomes["High"]["shipping"],
+            "Low landed cost": outcomes["Low"]["landed"], "Base landed cost": totals["landed_cost_aud_per_kg_h2"], "High landed cost": outcomes["High"]["landed"],
+            "Low delivered H2": outcomes["Low"]["delivered"], "Base delivered H2": totals["delivered_h2_kg_year"], "High delivered H2": outcomes["High"]["delivered"],
+            "Low emissions": outcomes["Low"]["emissions"], "Base emissions": totals["transport_chain_emissions_tco2e_year"], "High emissions": outcomes["High"]["emissions"],
+        })
+    return rows
 
 
 def metadata() -> dict[str, Any]:
+    route = REFERENCE["route"]
     return {
-        "departures": REFERENCE["departures"], "arrivals": REFERENCE["arrivals"],
-        "carriers": list(REFERENCE["carrier_defaults"]), "defaults": REFERENCE["workbook_case"],
-        "scope_note": "Attached workbook has complete active calculations for Ammonia and Hydrogen; other carrier columns are incomplete.",
+        "routes": [route["name"]], "departures": [route["departure"]],
+        "arrivals": [route["arrival"]], "carriers": list(REFERENCE["carrier_defaults"]),
+        "defaults": copy.deepcopy(REFERENCE["workbook_case"]),
+        "carrier_defaults": copy.deepcopy(REFERENCE["carrier_defaults"]),
+        "parameter_sources": copy.deepcopy(REFERENCE["parameter_sources"]),
+        "sensitivity_parameters": copy.deepcopy(REFERENCE["sensitivity_parameters"]),
+        "scope_note": "Transport-chain boundary; hydrogen and ammonia production are excluded.",
     }
