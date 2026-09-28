@@ -17,6 +17,24 @@ REFERENCE = json.loads(DATA_PATH.read_text(encoding="utf-8"))
 KNOT_TO_KM_PER_HOUR = 1.852
 GWP100_CH4 = 28.0
 GWP100_N2O = 265.0
+KG_PER_TONNE = 1_000.0
+KG_PER_KILOTONNE = 1_000_000.0
+KG_PER_MEGATONNE = 1_000_000_000.0
+
+
+def kg_year_to_t_year(value: float) -> float:
+    """Convert an annual mass flow from kg/year to t/year."""
+    return value / KG_PER_TONNE
+
+
+def kg_year_to_kt_year(value: float) -> float:
+    """Convert an annual mass flow from kg/year to kt/year."""
+    return value / KG_PER_KILOTONNE
+
+
+def kg_year_to_mt_year(value: float) -> float:
+    """Convert an annual mass flow from kg/year to Mt/year."""
+    return value / KG_PER_MEGATONNE
 
 
 def _num(value: Any, name: str, low: float | None = None, high: float | None = None) -> float:
@@ -254,18 +272,18 @@ def _carrier_result(name: str, p: dict[str, Any], c: dict[str, Any], route: dict
         "Carbon": shipping_carbon_cost, "Shipping BOG": shipping_bog_cost,
         "Storage BOG": storage_bog_cost,
     }
-    landed_components = copy.deepcopy(shipping_components)
+    delivered_components = copy.deepcopy(shipping_components)
     if name == "Ammonia":
-        landed_components["Ammonia cracking"] = recovered_h2_year * p["cracking_cost_usd_per_kg_h2"] / 1_000_000.0
-        landed_components["Cracking carbon"] = cracking_emissions * p["carbon_price_usd_tonne"] / 1_000_000.0
+        delivered_components["Ammonia cracking"] = recovered_h2_year * p["cracking_cost_usd_per_kg_h2"] / 1_000_000.0
+        delivered_components["Cracking carbon"] = cracking_emissions * p["carbon_price_usd_tonne"] / 1_000_000.0
 
     shipping_total = sum(shipping_components.values())
-    landed_total = sum(landed_components.values())
+    delivered_total = sum(delivered_components.values())
     aud_per_usd = 1.0 / p["aud_usd"]
     shipping_per_kg_h2 = shipping_total * 1_000_000.0 / theoretical_h2_year * aud_per_usd
-    landed_per_kg_h2 = landed_total * 1_000_000.0 / delivered_h2_year * aud_per_usd
+    delivered_cost_per_kg_h2 = delivered_total * 1_000_000.0 / delivered_h2_year * aud_per_usd
     shipping_breakdown = {k: v * 1_000_000.0 / theoretical_h2_year * aud_per_usd for k, v in shipping_components.items()}
-    landed_breakdown = {k: v * 1_000_000.0 / delivered_h2_year * aud_per_usd for k, v in landed_components.items()}
+    delivered_breakdown = {k: v * 1_000_000.0 / delivered_h2_year * aud_per_usd for k, v in delivered_components.items()}
 
     return {
         "carrier": name,
@@ -291,16 +309,19 @@ def _carrier_result(name: str, p: dict[str, Any], c: dict[str, Any], route: dict
             "export_required_m3": export_storage_m3, "import_required_m3": import_storage_m3,
             "export_capex_musd": export_storage_capex, "import_capex_musd": import_storage_capex,
         },
-        "annual_musd": landed_components,
+        "annual_musd": delivered_components,
         "annual_musd_shipping": shipping_components,
         "totals": {
             "capital_musd_year": ship_capital + storage_capital + additional_capital,
-            "shipping_total_musd_year": shipping_total, "landed_total_musd_year": landed_total,
+            "shipping_total_musd_year": shipping_total,
+            "delivered_transport_chain_total_musd_year": delivered_total,
+            "landed_total_musd_year": delivered_total,
             "delivered_medium_kg_year": usable_medium_year,
             "theoretical_h2_kg_year": theoretical_h2_year,
             "recovered_h2_kg_year": recovered_h2_year, "delivered_h2_kg_year": delivered_h2_year,
             "shipping_cost_aud_per_kg_h2": shipping_per_kg_h2,
-            "landed_cost_aud_per_kg_h2": landed_per_kg_h2,
+            "delivered_transport_chain_cost_aud_per_kg_h2": delivered_cost_per_kg_h2,
+            "landed_cost_aud_per_kg_h2": delivered_cost_per_kg_h2,
             "aud_per_kg_h2_graph": shipping_per_kg_h2,
             "delivered_energy_gj_year": usable_medium_year * c["lhv_mj_kg"] / 1000.0,
             "aud_per_tonne_medium": shipping_total * 1_000_000.0 / usable_medium_year * 1000.0 * aud_per_usd,
@@ -316,7 +337,8 @@ def _carrier_result(name: str, p: dict[str, Any], c: dict[str, Any], route: dict
         },
         "breakdown": {
             "shipping_aud_per_kg_h2": shipping_breakdown,
-            "landed_aud_per_kg_h2": landed_breakdown,
+            "delivered_transport_chain_aud_per_kg_h2": delivered_breakdown,
+            "landed_aud_per_kg_h2": delivered_breakdown,
             "aud_per_kg_h2_graph": shipping_breakdown,
         },
     }
@@ -362,29 +384,48 @@ def sensitivity_analysis(payload: dict[str, Any] | None = None, carrier: str = "
             result = calculate_case(scenario)["results"][0]["totals"]
             outcomes[level] = {
                 "shipping": result["shipping_cost_aud_per_kg_h2"],
-                "landed": result["landed_cost_aud_per_kg_h2"],
-                "delivered": result["delivered_h2_kg_year"],
+                "delivered_cost": result["delivered_transport_chain_cost_aud_per_kg_h2"],
+                "delivered_h2_t_year": kg_year_to_t_year(result["delivered_h2_kg_year"]),
                 "emissions": result["transport_chain_emissions_tco2e_year"],
             }
         totals = base_result["totals"]
         rows.append({
             "Parameter": spec["label"], "Low input": spec["low"], "Base input": spec["base"], "High input": spec["high"],
-            "Low shipping cost": outcomes["Low"]["shipping"], "Base shipping cost": totals["shipping_cost_aud_per_kg_h2"], "High shipping cost": outcomes["High"]["shipping"],
-            "Low landed cost": outcomes["Low"]["landed"], "Base landed cost": totals["landed_cost_aud_per_kg_h2"], "High landed cost": outcomes["High"]["landed"],
-            "Low delivered H2": outcomes["Low"]["delivered"], "Base delivered H2": totals["delivered_h2_kg_year"], "High delivered H2": outcomes["High"]["delivered"],
-            "Low emissions": outcomes["Low"]["emissions"], "Base emissions": totals["transport_chain_emissions_tco2e_year"], "High emissions": outcomes["High"]["emissions"],
+            "Shipping cost @ low input": outcomes["Low"]["shipping"],
+            "Shipping cost @ base input": totals["shipping_cost_aud_per_kg_h2"],
+            "Shipping cost @ high input": outcomes["High"]["shipping"],
+            "Delivered cost @ low input": outcomes["Low"]["delivered_cost"],
+            "Delivered cost @ base input": totals["delivered_transport_chain_cost_aud_per_kg_h2"],
+            "Delivered cost @ high input": outcomes["High"]["delivered_cost"],
+            "Delivered H2 (t/year) @ low input": outcomes["Low"]["delivered_h2_t_year"],
+            "Delivered H2 (t/year) @ base input": kg_year_to_t_year(totals["delivered_h2_kg_year"]),
+            "Delivered H2 (t/year) @ high input": outcomes["High"]["delivered_h2_t_year"],
+            "Emissions @ low input": outcomes["Low"]["emissions"],
+            "Emissions @ base input": totals["transport_chain_emissions_tco2e_year"],
+            "Emissions @ high input": outcomes["High"]["emissions"],
         })
     return rows
 
 
 def metadata() -> dict[str, Any]:
     route = REFERENCE["route"]
+    parameter_sources = copy.deepcopy(REFERENCE["parameter_sources"])
+    for row in parameter_sources:
+        source_text = str(row.get("source", ""))
+        if "doi.org" in source_text.lower() or "http://" in source_text.lower() or "https://" in source_text.lower():
+            row["citation_status"] = "Citation recorded"
+        elif row.get("type") in {"Literature value", "Official data"}:
+            row["citation_status"] = "Full citation to be verified"
+        elif row.get("type") == "Legacy workbook value":
+            row["citation_status"] = "Source details to be verified"
+        else:
+            row["citation_status"] = "Not applicable (assumption or derived value)"
     return {
         "routes": [route["name"]], "departures": [route["departure"]],
         "arrivals": [route["arrival"]], "carriers": list(REFERENCE["carrier_defaults"]),
         "defaults": copy.deepcopy(REFERENCE["workbook_case"]),
         "carrier_defaults": copy.deepcopy(REFERENCE["carrier_defaults"]),
-        "parameter_sources": copy.deepcopy(REFERENCE["parameter_sources"]),
+        "parameter_sources": parameter_sources,
         "sensitivity_parameters": copy.deepcopy(REFERENCE["sensitivity_parameters"]),
         "scope_note": "Transport-chain boundary; hydrogen and ammonia production are excluded.",
     }
