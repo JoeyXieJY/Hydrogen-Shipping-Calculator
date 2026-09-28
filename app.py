@@ -1,212 +1,244 @@
-"""HySupply Shipping Calculator — 初学者版 Streamlit 网页。
-
-运行命令：streamlit run app.py
-"""
-
+"""Streamlit interface for the Hydrogen Shipping Cost Model."""
 from __future__ import annotations
 
 import pandas as pd
 import streamlit as st
 
-from model import calculate_case, metadata
+from model import calculate_case, metadata, sensitivity_analysis
 
 
-# 1. 页面基础设置
-st.set_page_config(
-    page_title="HySupply Shipping Calculator",
-    page_icon="H₂",
-    layout="wide",
-)
-
-
-# 2. 简单样式：只负责颜色、边距和顶部导航
+st.set_page_config(page_title="Hydrogen Shipping Cost Model", page_icon="H₂", layout="wide")
 st.markdown(
     """
     <style>
     #MainMenu, header, footer {visibility: hidden;}
     .stApp {background: #ffffff; color: #142329;}
     .block-container {max-width: 1500px; padding: 0.7rem 1.8rem 2.5rem;}
-    .nav {
-        display: grid; grid-template-columns: 1fr auto 1fr; align-items: center;
-        min-height: 64px; margin: -0.7rem -1.8rem 1rem; padding: 0 2rem;
-        border-bottom: 1px solid #dce5e1; background: #ffffff;
-    }
-    .brand {display: flex; align-items: center; gap: 10px; color: #0b6b55; font-size: 1.45rem; font-weight: 800;}
-    .brand-mark {display: inline-grid; place-items: center; width: 42px; height: 42px; border-radius: 50%; background: #075646; color: white; font-size: 1rem;}
-    .nav-links {display: flex; gap: 2.2rem;}
-    .nav-links a {color: #52616b; text-decoration: none; font-size: 1rem; padding: 21px 0 17px;}
-    .nav-links a.active {color: #086c55; border-bottom: 2px solid #118865; font-weight: 700;}
-    .nav-status {justify-self: end; color: #617079; font-size: 0.9rem;}
-    .dot {display: inline-block; width: 9px; height: 9px; margin-right: 7px; border-radius: 50%; background: #19ae59;}
-    div[data-testid="stForm"] {border: 1px solid #dce5e1; border-radius: 12px; padding: 1.1rem;}
-    div[data-testid="stMetric"] {border: 1px solid #d7e5df; border-radius: 10px; padding: 1rem; background: #f8fcfa; min-height: 130px;}
-    div[data-testid="stMetricValue"] {color: #075c4b; font-weight: 750;}
-    div[data-testid="stVerticalBlockBorderWrapper"] {border-color: #dce5e1; border-radius: 12px;}
-    .section-title {font-size: 1.45rem; font-weight: 800; margin: 0 0 0.8rem; color: #142329;}
-    .section-number {color: #0b7a59; margin-right: 0.55rem;}
-    .note {font-size: 0.86rem; color: #68767e;}
-    @media (max-width: 800px) {
-        .nav {grid-template-columns: 1fr auto;}
-        .nav-links {display: none;}
-        .block-container {padding-left: 1rem; padding-right: 1rem;}
-    }
+    .nav {display:grid;grid-template-columns:1fr auto;align-items:center;min-height:64px;
+          margin:-0.7rem -1.8rem 1rem;padding:0 2rem;border-bottom:1px solid #dce5e1;background:#fff;}
+    .brand {display:flex;align-items:center;gap:10px;color:#0b6b55;font-size:1.35rem;font-weight:800;}
+    .brand-mark {display:inline-grid;place-items:center;width:42px;height:42px;border-radius:50%;background:#075646;color:white;}
+    .nav-status {color:#617079;font-size:.9rem;}.dot {display:inline-block;width:9px;height:9px;margin-right:7px;border-radius:50%;background:#19ae59;}
+    div[data-testid="stForm"] {border:1px solid #dce5e1;border-radius:12px;padding:1.1rem;}
+    div[data-testid="stMetric"] {border:1px solid #d7e5df;border-radius:10px;padding:1rem;background:#f8fcfa;min-height:125px;}
+    div[data-testid="stMetricValue"] {color:#075c4b;font-weight:750;}
+    .section-title {font-size:1.4rem;font-weight:800;margin:0 0 .8rem;color:#142329;}
+    .section-number {color:#0b7a59;margin-right:.55rem;}
+    .scope {padding:.7rem 1rem;border-left:4px solid #0b7a59;background:#f5faf8;color:#42545c;margin-bottom:1rem;}
+    @media (max-width:800px){.block-container{padding-left:1rem;padding-right:1rem}.brand{font-size:1.08rem}}
     </style>
-
     <nav class="nav">
       <div class="brand"><span class="brand-mark">H₂</span>Hydrogen Shipping Cost Model</div>
-      <div class="nav-links">
-        <a class="active" href="#calculator">Calculator</a>
-      </div>
       <div class="nav-status"><span class="dot"></span>Model ready</div>
     </nav>
-    <div id="calculator"></div>
     """,
     unsafe_allow_html=True,
 )
 
+INFO = metadata()
+D = INFO["defaults"]
+C = INFO["carrier_defaults"]
 
-MODEL_INFO = metadata()
-DEFAULTS = MODEL_INFO["defaults"]
 
-
-def result_by_carrier(output: dict) -> dict:
-    """把结果列表转换为按运输介质名称索引的字典。"""
+def by_carrier(output: dict) -> dict[str, dict]:
     return {item["carrier"]: item for item in output["results"]}
 
 
-def cost_groups(result: dict) -> dict[str, float]:
-    """把详细成本合并成三组，用于堆叠柱状图。"""
-    values = result["breakdown"]["aud_per_kg_h2_graph"]
-    capex_names = {"Ship CAPEX", "Storage CAPEX", "Additional CAPEX"}
-    loss_names = {"Fuel", "Carbon", "Shipping BOG", "Storage BOG"}
-    groups = {"CAPEX": 0.0, "OPEX": 0.0, "Fuel & losses": 0.0}
-    for name, value in values.items():
-        if name in capex_names:
+def cost_groups(result: dict, landed: bool) -> dict[str, float]:
+    values = result["breakdown"]["landed_aud_per_kg_h2" if landed else "shipping_aud_per_kg_h2"]
+    capex = {"Ship CAPEX", "Storage CAPEX", "Additional CAPEX"}
+    losses = {"Fuel", "Carbon", "Shipping BOG", "Storage BOG", "Cracking carbon"}
+    groups = {"CAPEX": 0.0, "OPEX": 0.0, "Fuel, losses & carbon": 0.0, "Cracking": 0.0}
+    for key, value in values.items():
+        if key in capex:
             groups["CAPEX"] += value
-        elif name in loss_names:
-            groups["Fuel & losses"] += value
+        elif key == "Ammonia cracking":
+            groups["Cracking"] += value
+        elif key in losses:
+            groups["Fuel, losses & carbon"] += value
         else:
             groups["OPEX"] += value
     return groups
 
 
-# 3. 左侧输入、右侧输出
-input_column, output_column = st.columns([0.34, 0.66], gap="medium")
-
-with input_column:
+left, right = st.columns([0.36, 0.64], gap="medium")
+with left:
     st.markdown('<div class="section-title"><span class="section-number">01</span>Scenario inputs</div>', unsafe_allow_html=True)
+    with st.form("inputs"):
+        route_name = st.selectbox("Route", INFO["routes"], disabled=True)
+        departure = st.selectbox("Departure port", INFO["departures"], disabled=True)
+        arrival = st.selectbox("Arrival port", INFO["arrivals"], disabled=True)
+        voyage_factor = st.number_input("Voyage time adjustment factor", 1.0, 3.0, D["voyage_time_adjustment_factor"], 0.05,
+            help="1.00 uses the distance-derived duration; increase for weather or operational delays.")
+        base_days = 7148.72 / (20.0 * 1.852 * 24.0)
+        st.caption(f"Effective one-way voyage duration: {base_days * voyage_factor:.2f} days")
 
-    with st.form("shipping_inputs"):
-        route_name = st.selectbox("Route", ["Australia – Japan (Base case)"])
-        departure = st.selectbox("Departure port", ["Gladstone (QLD)"])
-        arrival = st.selectbox("Arrival port", ["Tokyo (Japan)"])
+        a, b = st.columns(2)
+        operating_days = a.number_input("Operating days/year", 1.0, 366.0, D["operating_days_year"], 1.0)
+        port_round_trip = b.number_input("Port days/round trip", 0.0, 200.0, D["port_days_each_end"] * 2, 0.5)
+        carriers = st.multiselect("Carrier type", INFO["carriers"], default=INFO["carriers"])
 
-        day_col, speed_col = st.columns(2)
-        with day_col:
-            one_way_days = st.number_input("One-way days", min_value=0.1, value=11.0, step=0.1)
-        with speed_col:
-            ship_speed = st.number_input("Ship speed (knots)", min_value=0.1, value=20.0, step=0.5)
+        with st.expander("Economic assumptions"):
+            a, b = st.columns(2)
+            interest = a.number_input("Interest rate (%)", 0.0, 100.0, D["interest_rate_pct"], 0.5)
+            life = b.number_input("Economic life (years)", 1.0, 100.0, D["economic_life_years"], 1.0)
+            a, b = st.columns(2)
+            aud_usd = a.number_input("AUD–USD rate", 0.01, 10.0, D["aud_usd"], 0.01)
+            carbon_price = b.number_input("Carbon price (USD/tCO₂e)", 0.0, 10000.0, D["carbon_price_usd_tonne"], 10.0)
+            include_h2_carbon = st.checkbox("Include supplementary H₂ leakage impact in carbon cost", D["include_h2_leakage_in_carbon_cost"])
 
-        operation_col, port_col = st.columns(2)
-        with operation_col:
-            operating_days = st.number_input("Operating days (per year)", min_value=1.0, max_value=366.0, value=25.0, step=1.0)
-        with port_col:
-            port_days = st.number_input("Port days (per round trip)", min_value=0.0, value=3.0, step=0.5)
+        with st.expander("Ammonia cracking"):
+            cracker_conversion = st.number_input("Cracker conversion (%)", 95.0, 99.9, D["cracker_conversion_pct"], 0.1)
+            psa_recovery = st.number_input("PSA recovery (%)", 65.0, 90.0, D["psa_recovery_pct"], 1.0)
+            cracking_cost = st.number_input("Cracking cost (USD/kg H₂)", 0.20, 0.80, D["cracking_cost_usd_per_kg_h2"], 0.05)
+            heat_source = st.selectbox("Cracking heat source", ["Electric heating", "Process hydrogen/off-gas", "Natural gas"])
+            a, b = st.columns(2)
+            cracking_electricity = a.number_input("Electricity (kWh/kg H₂)", 0.0, 20.0, D["cracking_electricity_kwh_kg_h2"], 0.1)
+            cracking_thermal = b.number_input("Thermal energy (kWhth/kg H₂)", 0.0, 30.0, D["cracking_thermal_kwhth_kg_h2"], 0.1)
+            heater_efficiency = st.number_input("Electric heater efficiency (%)", 85.0, 100.0, D["heater_efficiency_pct"], 1.0)
 
-        carriers = st.multiselect(
-            "Carrier type",
-            options=["Ammonia", "Hydrogen"],
-            default=["Ammonia", "Hydrogen"],
-            help="可以选择一种，也可以同时比较两种运输介质。",
-        )
+        with st.expander("Storage, fill and heel"):
+            a, b = st.columns(2)
+            export_days = a.number_input("Export storage (days)", 1.0, 7.0, D["export_storage_days"], 1.0)
+            import_days = b.number_input("Import storage (days)", 3.0, 30.0, D["import_storage_days"], 1.0)
+            st.caption("Ammonia")
+            a, b = st.columns(2)
+            nh3_storage = a.number_input("NH₃ storage loss (%/day)", 0.0, 0.025, C["Ammonia"]["storage_bog_pct_day"], 0.001, format="%.3f")
+            nh3_bog = b.number_input("NH₃ shipping BOG (%/day)", 0.025, 0.10, C["Ammonia"]["transport_bog_pct_day"], 0.005, format="%.3f")
+            a, b = st.columns(2)
+            nh3_fill = a.number_input("NH₃ fill fraction (%)", 95.0, 98.0, C["Ammonia"]["fill_fraction_pct"], 0.5)
+            nh3_heel = b.number_input("NH₃ heel (%)", 2.0, 10.0, C["Ammonia"]["heel_fraction_pct"], 0.5)
+            st.caption("Liquid hydrogen")
+            a, b = st.columns(2)
+            h2_storage = a.number_input("LH₂ storage BOG (%/day)", 0.01, 0.30, C["Hydrogen"]["storage_bog_pct_day"], 0.01)
+            h2_bog = b.number_input("LH₂ shipping BOG (%/day)", 0.10, 0.50, C["Hydrogen"]["transport_bog_pct_day"], 0.05)
+            a, b = st.columns(2)
+            h2_fill = a.number_input("LH₂ fill fraction (%)", 90.0, 95.0, C["Hydrogen"]["fill_fraction_pct"], 0.5)
+            h2_heel = b.number_input("LH₂ heel (%)", 2.0, 10.0, C["Hydrogen"]["heel_fraction_pct"], 0.5)
 
-        rate_col, life_col = st.columns(2)
-        with rate_col:
-            interest_rate = st.number_input("Interest rate (%)", min_value=0.0, value=5.0, step=0.5)
-        with life_col:
-            economic_life = st.number_input("Economic life (years)", min_value=1.0, value=20.0, step=1.0)
-
-        exchange_col, carbon_col = st.columns(2)
-        with exchange_col:
-            aud_usd = st.number_input("AUD – USD rate", min_value=0.01, value=0.70, step=0.01)
-        with carbon_col:
-            carbon_price = st.number_input("Carbon price (USD/tCO₂e)", min_value=0.0, value=0.0, step=10.0)
+        with st.expander("Emissions and terminal energy"):
+            a, b = st.columns(2)
+            qld_grid = a.number_input("Queensland grid (kg CO₂e/kWh)", 0.0, 2.0, D["queensland_grid_kgco2e_kwh"], 0.01)
+            japan_grid = b.number_input("Japan grid (kg CO₂e/kWh)", 0.0, 2.0, D["japan_grid_kgco2e_kwh"], 0.01)
+            a, b = st.columns(2)
+            nh3_terminal = a.number_input("NH₃ terminal electricity (kWh/kg)", 0.0, 2.0, C["Ammonia"]["terminal_electricity_kwh_kg"], 0.001, format="%.3f")
+            h2_terminal = b.number_input("LH₂ terminal electricity (kWh/kg)", 0.0, 3.0, C["Hydrogen"]["terminal_electricity_kwh_kg"], 0.01)
+            st.caption("Import terminal values use the same editable proxy assumption; they are not Tokyo measurements.")
+            a, b = st.columns(2)
+            n2o_intensity = a.number_input("NH₃-engine N₂O (g CO₂e/MJ)", 0.0, 41.0, D["ammonia_engine_n2o_gco2e_mj"], 0.5)
+            h2_gwp = b.number_input("Hydrogen GWP100", 0.0, 30.0, D["hydrogen_gwp100"], 0.1)
+            bog_managed = st.number_input("BOG controlled/utilised (%)", 0.0, 100.0, 100.0, 1.0)
+            st.caption(f"BOG vented to atmosphere: {100.0 - bog_managed:.1f}%")
+            nh3_slip = st.number_input("NH₃ fuel slip (%)", 0.0, 10.0, 0.0, 0.01)
 
         submitted = st.form_submit_button("Calculate", type="primary", width="stretch")
 
-
-# 4. 调用 model.py；业务公式不会写在页面文件里
 payload = {
-    "departure": departure,
-    "arrival": arrival,
-    "one_way_days": one_way_days,
-    "ship_speed_knots": ship_speed,
-    "operating_days_year": operating_days,
-    "port_days_each_end": port_days / 2,
-    "interest_rate_pct": interest_rate,
-    "economic_life_years": economic_life,
-    "aud_usd": aud_usd,
-    "carbon_price_usd_tonne": carbon_price,
-    "carriers": carriers,
+    "route": route_name, "departure": departure, "arrival": arrival,
+    "voyage_time_adjustment_factor": voyage_factor, "operating_days_year": operating_days,
+    "port_days_each_end": port_round_trip / 2.0, "carriers": carriers,
+    "interest_rate_pct": interest, "economic_life_years": life, "aud_usd": aud_usd,
+    "carbon_price_usd_tonne": carbon_price, "include_h2_leakage_in_carbon_cost": include_h2_carbon,
+    "export_storage_days": export_days, "import_storage_days": import_days,
+    "cracker_conversion_pct": cracker_conversion, "psa_recovery_pct": psa_recovery,
+    "cracking_cost_usd_per_kg_h2": cracking_cost, "cracking_heat_source": heat_source,
+    "cracking_electricity_kwh_kg_h2": cracking_electricity,
+    "cracking_thermal_kwhth_kg_h2": cracking_thermal, "heater_efficiency_pct": heater_efficiency,
+    "queensland_grid_kgco2e_kwh": qld_grid, "japan_grid_kgco2e_kwh": japan_grid,
+    "ammonia_engine_n2o_gco2e_mj": n2o_intensity, "hydrogen_gwp100": h2_gwp,
+    "carrier_overrides": {
+        "Ammonia": {"transport_bog_pct_day": nh3_bog, "storage_bog_pct_day": nh3_storage,
+            "fill_fraction_pct": nh3_fill, "heel_fraction_pct": nh3_heel,
+            "bog_managed_pct": bog_managed, "bog_vented_pct": 100.0 - bog_managed,
+            "terminal_electricity_kwh_kg": nh3_terminal, "import_terminal_electricity_kwh_kg": nh3_terminal,
+            "nh3_slip_pct_fuel": nh3_slip},
+        "Hydrogen": {"transport_bog_pct_day": h2_bog, "storage_bog_pct_day": h2_storage,
+            "fill_fraction_pct": h2_fill, "heel_fraction_pct": h2_heel,
+            "bog_managed_pct": bog_managed, "bog_vented_pct": 100.0 - bog_managed,
+            "terminal_electricity_kwh_kg": h2_terminal, "import_terminal_electricity_kwh_kg": h2_terminal},
+    },
 }
 
 try:
     output = calculate_case(payload)
 except ValueError as error:
-    with output_column:
+    with right:
         st.error(str(error))
     st.stop()
 
-
-with output_column:
-    results = result_by_carrier(output)
+with right:
+    results = by_carrier(output)
     st.markdown('<div class="section-title"><span class="section-number">02</span>Model outputs</div>', unsafe_allow_html=True)
-    st.caption(f"{route_name}: {departure} → {arrival}")
+    st.markdown('<div class="scope"><b>Transport-chain boundary:</b> Australian export terminal → ocean shipping → Japanese import terminal → ammonia cracking. Hydrogen and ammonia production are excluded.</div>', unsafe_allow_html=True)
+    first = next(iter(results.values()))
+    cheapest = min(results.values(), key=lambda x: x["totals"]["shipping_cost_aud_per_kg_h2"])
+    m1, m2, m3, m4 = st.columns(4)
+    m1.metric("Lowest shipping cost", f"A$ {cheapest['totals']['shipping_cost_aud_per_kg_h2']:.2f}/kg H₂", cheapest["carrier"])
+    m2.metric("Route distance", f"{first['route']['distance_km']:,.0f} km", "one way")
+    m3.metric("Effective voyage", f"{first['route']['one_way_days']:.2f} days", "one way")
+    m4.metric("Annual sailings", f"{first['operations']['trips_per_year']:.2f}", "round trips/year")
 
-    cheapest = min(results.values(), key=lambda item: item["totals"]["aud_per_kg_h2_graph"])
-    first_result = next(iter(results.values()))
-
-    metric_1, metric_2, metric_3 = st.columns(3)
-    with metric_1:
-        st.metric(
-            "Lowest shipping cost",
-            f"A$ {cheapest['totals']['aud_per_kg_h2_graph']:.2f}",
-            f"per kg H₂ delivered · {cheapest['carrier']}",
-        )
-    with metric_2:
-        st.metric("Route distance", f"{first_result['route']['distance_nm']:,.0f} nm", "one way")
-    with metric_3:
-        st.metric("Annual sailings", f"{first_result['operations']['trips_per_year']:.2f}", "round trips per year")
+    summary_rows = []
+    for name, result in results.items():
+        t = result["totals"]
+        summary_rows.append({
+            "Carrier": name, "Shipping cost (A$/kg H₂-eq)": t["shipping_cost_aud_per_kg_h2"],
+            "Post-cracking landed cost (A$/kg H₂)": t["landed_cost_aud_per_kg_h2"],
+            "Delivered H₂ (t/year)": t["delivered_h2_kg_year"] / 1000.0,
+            "Transport-chain emissions (t CO₂e/year)": t["transport_chain_emissions_tco2e_year"],
+            "Intensity (kg CO₂e/kg H₂)": t["emissions_kgco2e_per_kg_delivered_h2"],
+            "Supplementary H₂ leakage (t CO₂e/year)": t["supplementary_h2_leakage_tco2e_year"],
+        })
+    summary = pd.DataFrame(summary_rows)
+    st.dataframe(summary.style.format(precision=3, thousands=","), hide_index=True, width="stretch")
+    st.download_button("Download result summary (CSV)", summary.to_csv(index=False).encode("utf-8-sig"), "hydrogen_shipping_results.csv", "text/csv")
 
     with st.container(border=True):
-        st.subheader("Total shipping cost")
-        total_rows = [
-            {"Carrier": name, "A$ per kg H₂": result["totals"]["aud_per_kg_h2_graph"]}
-            for name, result in results.items()
-        ]
-        total_chart = pd.DataFrame(total_rows)
-        st.bar_chart(
-            total_chart,
-            x="Carrier",
-            y="A$ per kg H₂",
-            color="#0b665c",
-            height=270,
-            width="stretch",
-        )
+        st.subheader("Shipping and post-cracking landed cost")
+        cost_chart = summary.set_index("Carrier")[["Shipping cost (A$/kg H₂-eq)", "Post-cracking landed cost (A$/kg H₂)"]]
+        st.bar_chart(cost_chart, height=280, width="stretch")
 
     with st.container(border=True):
         st.subheader("Cost breakdown")
-        breakdown_rows = []
-        for name, result in results.items():
-            breakdown_rows.append({"Carrier": name, **cost_groups(result)})
-        breakdown_chart = pd.DataFrame(breakdown_rows)
-        st.bar_chart(
-            breakdown_chart,
-            x="Carrier",
-            y=["CAPEX", "OPEX", "Fuel & losses"],
-            color=["#0b5d58", "#37c84a", "#f58a3a"],
-            height=290,
-            width="stretch",
-        )
+        landed_view = st.toggle("Show landed-cost breakdown", value=True)
+        groups = pd.DataFrame([{"Carrier": name, **cost_groups(result, landed_view)} for name, result in results.items()]).set_index("Carrier")
+        st.bar_chart(groups, height=290, width="stretch")
 
-    st.caption("All results are estimates based on the selected assumptions.")
+    carrier_tabs = st.tabs(list(results))
+    for tab, (name, result) in zip(carrier_tabs, results.items()):
+        with tab:
+            t = result["totals"]
+            a, b, c = st.columns(3)
+            a.metric("Usable transported medium", f"{t['delivered_medium_kg_year']/1e6:,.2f} Mt/year")
+            b.metric("Delivered H₂", f"{t['delivered_h2_kg_year']/1e6:,.2f} Mt/year")
+            c.metric("GHG intensity", f"{t['emissions_kgco2e_per_kg_delivered_h2']:.3f} kg CO₂e/kg H₂")
+            st.caption(f"NH₃ slip: {t['nh3_slip_kg_year']:,.1f} kg/year · Supplementary H₂ leakage impact: {t['supplementary_h2_leakage_tco2e_year']:,.1f} t CO₂e/year")
+            emissions = pd.DataFrame([{"Stage": k, "t CO₂e/year": v} for k, v in result["emissions_breakdown_tco2e"].items()])
+            st.bar_chart(emissions, x="Stage", y="t CO₂e/year", height=240, width="stretch")
+            with st.expander("Mass-balance audit"):
+                mass = pd.DataFrame([{"Flow": k.replace("_", " ").title(), "kg/trip": v} for k, v in result["mass_balance_per_trip_kg"].items()])
+                st.dataframe(mass.style.format({"kg/trip": "{:,.0f}"}), hide_index=True, width="stretch")
+
+st.caption("All results are estimates based on the selected assumptions.")
+
+with st.expander("Sensitivity analysis"):
+    st.write("One-at-a-time scenario analysis. Ranges are scenarios, not statistical confidence intervals.")
+    sensitivity_carrier = st.selectbox("Carrier for sensitivity analysis", carriers or INFO["carriers"], key="sensitivity_carrier")
+    try:
+        sensitivity = pd.DataFrame(sensitivity_analysis(payload, sensitivity_carrier))
+        metric = st.selectbox("Rank by", ["Landed cost", "Shipping cost", "Emissions"])
+        prefix = {"Landed cost": "landed cost", "Shipping cost": "shipping cost", "Emissions": "emissions"}[metric]
+        sensitivity["Impact span"] = (sensitivity[f"High {prefix}"] - sensitivity[f"Low {prefix}"]).abs()
+        sensitivity = sensitivity.sort_values("Impact span", ascending=False)
+        chart = sensitivity.head(15).set_index("Parameter")[[f"Low {prefix}", f"Base {prefix}", f"High {prefix}"]]
+        st.bar_chart(chart, height=430, width="stretch")
+        st.dataframe(sensitivity, hide_index=True, width="stretch")
+        st.download_button("Download sensitivity results (CSV)", sensitivity.to_csv(index=False).encode("utf-8-sig"), f"sensitivity_{sensitivity_carrier.lower()}.csv", "text/csv")
+    except ValueError as error:
+        st.warning(str(error))
+
+with st.expander("Parameter sources"):
+    sources = pd.DataFrame(INFO["parameter_sources"])
+    sources["base_value"] = sources["base_value"].astype(str)
+    st.dataframe(sources, hide_index=True, width="stretch")
+    st.download_button("Download sources (CSV)", sources.to_csv(index=False).encode("utf-8-sig"), "parameter_sources.csv", "text/csv")
