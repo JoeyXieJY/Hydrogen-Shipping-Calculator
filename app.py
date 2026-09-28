@@ -5,6 +5,14 @@ import pandas as pd
 import streamlit as st
 
 from model import calculate_case, metadata, sensitivity_analysis
+from presentation import (
+    DELIVERED_COST_LABEL,
+    SHIPPING_COST_LABEL,
+    annual_quantity_metric_values,
+    build_cost_comparison_rows,
+    build_summary_rows,
+    lowest_delivered_cost,
+)
 
 
 st.set_page_config(page_title="Hydrogen Shipping Cost Model", page_icon="H₂", layout="wide")
@@ -21,7 +29,19 @@ st.markdown(
     .nav-status {color:#617079;font-size:.9rem;}.dot {display:inline-block;width:9px;height:9px;margin-right:7px;border-radius:50%;background:#19ae59;}
     div[data-testid="stForm"] {border:1px solid #dce5e1;border-radius:12px;padding:1.1rem;}
     div[data-testid="stMetric"] {border:1px solid #d7e5df;border-radius:10px;padding:1rem;background:#f8fcfa;min-height:125px;}
-    div[data-testid="stMetricValue"] {color:#075c4b;font-weight:750;}
+    div[data-testid="stMetricValue"] {
+        color:#075c4b;font-weight:750;
+        font-size:clamp(1.05rem,1.55vw,1.75rem);
+        line-height:1.2;white-space:normal;overflow:visible;text-overflow:clip;
+    }
+    div[data-testid="stMetric"] div[data-testid="stMarkdownContainer"] p {
+        white-space:normal!important;overflow:visible!important;text-overflow:clip!important;
+        overflow-wrap:anywhere;line-height:1.2;
+    }
+    div[data-testid="stMetricValue"] p {
+        font-size:clamp(.9rem,1.35vw,1.65rem)!important;
+        white-space:nowrap!important;overflow-wrap:normal;
+    }
     .section-title {font-size:1.4rem;font-weight:800;margin:0 0 .8rem;color:#142329;}
     .section-number {color:#0b7a59;margin-right:.55rem;}
     .scope {padding:.7rem 1rem;border-left:4px solid #0b7a59;background:#f5faf8;color:#42545c;margin-bottom:1rem;}
@@ -44,8 +64,8 @@ def by_carrier(output: dict) -> dict[str, dict]:
     return {item["carrier"]: item for item in output["results"]}
 
 
-def cost_groups(result: dict, landed: bool) -> dict[str, float]:
-    values = result["breakdown"]["landed_aud_per_kg_h2" if landed else "shipping_aud_per_kg_h2"]
+def cost_groups(result: dict, delivered: bool) -> dict[str, float]:
+    values = result["breakdown"]["delivered_transport_chain_aud_per_kg_h2" if delivered else "shipping_aud_per_kg_h2"]
     capex = {"Ship CAPEX", "Storage CAPEX", "Additional CAPEX"}
     losses = {"Fuel", "Carbon", "Shipping BOG", "Storage BOG", "Cracking carbon"}
     groups = {"CAPEX": 0.0, "OPEX": 0.0, "Fuel, losses & carbon": 0.0, "Cracking": 0.0}
@@ -171,37 +191,35 @@ with right:
     st.markdown('<div class="section-title"><span class="section-number">02</span>Model outputs</div>', unsafe_allow_html=True)
     st.markdown('<div class="scope"><b>Transport-chain boundary:</b> Australian export terminal → ocean shipping → Japanese import terminal → ammonia cracking. Hydrogen and ammonia production are excluded.</div>', unsafe_allow_html=True)
     first = next(iter(results.values()))
-    cheapest = min(results.values(), key=lambda x: x["totals"]["shipping_cost_aud_per_kg_h2"])
+    cheapest = lowest_delivered_cost(results.values())
     m1, m2, m3, m4 = st.columns(4)
-    m1.metric("Lowest shipping cost", f"A$ {cheapest['totals']['shipping_cost_aud_per_kg_h2']:.2f}/kg H₂", cheapest["carrier"])
+    m1.metric(
+        "Lowest delivered cost",
+        f"A${cheapest['totals']['delivered_transport_chain_cost_aud_per_kg_h2']:.2f}/kg H₂",
+        cheapest["carrier"],
+    )
     m2.metric("Route distance", f"{first['route']['distance_km']:,.0f} km", "one way")
     m3.metric("Effective voyage", f"{first['route']['one_way_days']:.2f} days", "one way")
     m4.metric("Annual sailings", f"{first['operations']['trips_per_year']:.2f}", "round trips/year")
 
-    summary_rows = []
-    for name, result in results.items():
-        t = result["totals"]
-        summary_rows.append({
-            "Carrier": name, "Shipping cost (A$/kg H₂-eq)": t["shipping_cost_aud_per_kg_h2"],
-            "Post-cracking landed cost (A$/kg H₂)": t["landed_cost_aud_per_kg_h2"],
-            "Delivered H₂ (t/year)": t["delivered_h2_kg_year"] / 1000.0,
-            "Transport-chain emissions (t CO₂e/year)": t["transport_chain_emissions_tco2e_year"],
-            "Intensity (kg CO₂e/kg H₂)": t["emissions_kgco2e_per_kg_delivered_h2"],
-            "Supplementary H₂ leakage (t CO₂e/year)": t["supplementary_h2_leakage_tco2e_year"],
-        })
-    summary = pd.DataFrame(summary_rows)
+    summary = pd.DataFrame(build_summary_rows(results))
     st.dataframe(summary.style.format(precision=3, thousands=","), hide_index=True, width="stretch")
     st.download_button("Download result summary (CSV)", summary.to_csv(index=False).encode("utf-8-sig"), "hydrogen_shipping_results.csv", "text/csv")
 
     with st.container(border=True):
-        st.subheader("Shipping and post-cracking landed cost")
-        cost_chart = summary.set_index("Carrier")[["Shipping cost (A$/kg H₂-eq)", "Post-cracking landed cost (A$/kg H₂)"]]
-        st.bar_chart(cost_chart, height=280, width="stretch")
+        st.subheader("Shipping and delivered transport-chain cost")
+        cost_chart = pd.DataFrame(build_cost_comparison_rows(results)).set_index("Carrier")
+        st.bar_chart(
+            cost_chart[[SHIPPING_COST_LABEL, DELIVERED_COST_LABEL]],
+            height=280,
+            width="stretch",
+            stack=False,
+        )
 
     with st.container(border=True):
         st.subheader("Cost breakdown")
-        landed_view = st.toggle("Show landed-cost breakdown", value=True)
-        groups = pd.DataFrame([{"Carrier": name, **cost_groups(result, landed_view)} for name, result in results.items()]).set_index("Carrier")
+        delivered_view = st.toggle("Show delivered-cost breakdown", value=True)
+        groups = pd.DataFrame([{"Carrier": name, **cost_groups(result, delivered_view)} for name, result in results.items()]).set_index("Carrier")
         st.bar_chart(groups, height=290, width="stretch")
 
     carrier_tabs = st.tabs(list(results))
@@ -209,9 +227,10 @@ with right:
         with tab:
             t = result["totals"]
             a, b, c = st.columns(3)
-            a.metric("Usable transported medium", f"{t['delivered_medium_kg_year']/1e6:,.2f} Mt/year")
-            b.metric("Delivered H₂", f"{t['delivered_h2_kg_year']/1e6:,.2f} Mt/year")
-            c.metric("GHG intensity", f"{t['emissions_kgco2e_per_kg_delivered_h2']:.3f} kg CO₂e/kg H₂")
+            medium_value, h2_value = annual_quantity_metric_values(result)
+            a.metric("Usable transported medium", medium_value)
+            b.metric("Delivered H₂", h2_value)
+            c.metric("GHG intensity", f"{t['emissions_kgco2e_per_kg_delivered_h2']:.3f} kgCO₂e/kgH₂")
             st.caption(f"NH₃ slip: {t['nh3_slip_kg_year']:,.1f} kg/year · Supplementary H₂ leakage impact: {t['supplementary_h2_leakage_tco2e_year']:,.1f} t CO₂e/year")
             emissions = pd.DataFrame([{"Stage": k, "t CO₂e/year": v} for k, v in result["emissions_breakdown_tco2e"].items()])
             st.bar_chart(emissions, x="Stage", y="t CO₂e/year", height=240, width="stretch")
@@ -226,11 +245,20 @@ with st.expander("Sensitivity analysis"):
     sensitivity_carrier = st.selectbox("Carrier for sensitivity analysis", carriers or INFO["carriers"], key="sensitivity_carrier")
     try:
         sensitivity = pd.DataFrame(sensitivity_analysis(payload, sensitivity_carrier))
-        metric = st.selectbox("Rank by", ["Landed cost", "Shipping cost", "Emissions"])
-        prefix = {"Landed cost": "landed cost", "Shipping cost": "shipping cost", "Emissions": "emissions"}[metric]
-        sensitivity["Impact span"] = (sensitivity[f"High {prefix}"] - sensitivity[f"Low {prefix}"]).abs()
+        metric = st.selectbox("Rank by", ["Delivered cost", "Shipping cost", "Emissions"])
+        metric_columns = {
+            "Delivered cost": ["Delivered cost @ low input", "Delivered cost @ base input", "Delivered cost @ high input"],
+            "Shipping cost": ["Shipping cost @ low input", "Shipping cost @ base input", "Shipping cost @ high input"],
+            "Emissions": ["Emissions @ low input", "Emissions @ base input", "Emissions @ high input"],
+        }
+        selected_columns = metric_columns[metric]
+        sensitivity["Impact span"] = (sensitivity[selected_columns[2]] - sensitivity[selected_columns[0]]).abs()
         sensitivity = sensitivity.sort_values("Impact span", ascending=False)
-        chart = sensitivity.head(15).set_index("Parameter")[[f"Low {prefix}", f"Base {prefix}", f"High {prefix}"]]
+        chart = sensitivity.head(15).set_index("Parameter")[selected_columns].rename(columns={
+            selected_columns[0]: "Low input scenario",
+            selected_columns[1]: "Base scenario",
+            selected_columns[2]: "High input scenario",
+        })
         st.bar_chart(chart, height=430, width="stretch")
         st.dataframe(sensitivity, hide_index=True, width="stretch")
         st.download_button("Download sensitivity results (CSV)", sensitivity.to_csv(index=False).encode("utf-8-sig"), f"sensitivity_{sensitivity_carrier.lower()}.csv", "text/csv")

@@ -24,7 +24,7 @@
 recovered H2 = usable NH3 × 0.177 × cracker conversion × PSA recovery
 ```
 
-The model reports shipping cost and post-cracking landed hydrogen cost separately.
+The model reports shipping cost and delivered transport-chain cost separately. The ammonia result still includes cracking cost; the hydrogen route does not include ammonia cracking.
 
 ## Emissions
 

@@ -5,7 +5,25 @@ import math
 import unittest
 from pathlib import Path
 
-from model import REFERENCE, calculate_case, exponential_remaining, metadata, sensitivity_analysis
+from model import (
+    REFERENCE,
+    calculate_case,
+    exponential_remaining,
+    kg_year_to_kt_year,
+    kg_year_to_mt_year,
+    kg_year_to_t_year,
+    metadata,
+    sensitivity_analysis,
+)
+from presentation import (
+    DELIVERED_COST_LABEL,
+    DELIVERED_H2_LABEL,
+    SHIPPING_COST_LABEL,
+    annual_quantity_metric_values,
+    build_cost_comparison_rows,
+    build_summary_rows,
+    lowest_delivered_cost,
+)
 
 
 class ModelTests(unittest.TestCase):
@@ -26,6 +44,11 @@ class ModelTests(unittest.TestCase):
         self.assertAlmostEqual(route["calculated_one_way_days"], expected)
         adjusted = calculate_case({"carriers": ["Hydrogen"], "voyage_time_adjustment_factor": 1.25})["results"][0]
         self.assertAlmostEqual(adjusted["route"]["one_way_days"], expected * 1.25)
+
+    def test_voyage_adjustment_105_regression(self):
+        adjusted = calculate_case({"voyage_time_adjustment_factor": 1.05})["results"][0]
+        self.assertAlmostEqual(adjusted["route"]["one_way_days"], 8.44375, places=5)
+        self.assertAlmostEqual(adjusted["operations"]["trips_per_year"], 17.59899434318039)
 
     def test_longer_voyage_does_not_reduce_fuel_or_bog(self):
         base = self.results["Hydrogen"]
@@ -133,6 +156,40 @@ class ModelTests(unittest.TestCase):
         self.assertNotIn("Ship speed", app)
         self.assertIn("Calculate", app)
         self.assertIn("All results are estimates based on the selected assumptions.", app)
+        self.assertIn("Lowest delivered cost", app)
+        self.assertNotIn("Lowest shipping cost", app)
+        self.assertNotIn("Post-cracking landed cost", app)
+        self.assertIn("stack=False", app)
+
+    def test_annual_mass_unit_conversions(self):
+        value = 1_000_000_000.0
+        self.assertEqual(kg_year_to_t_year(value), 1_000_000.0)
+        self.assertEqual(kg_year_to_kt_year(value), 1_000.0)
+        self.assertEqual(kg_year_to_mt_year(value), 1.0)
+
+    def test_default_delivered_h2_card_is_kilotonne_per_year(self):
+        medium, delivered_h2 = annual_quantity_metric_values(self.results["Ammonia"])
+        self.assertEqual(medium, "1,854.93 kt/year")
+        self.assertEqual(delivered_h2, "243.78 kt/year")
+
+    def test_default_main_table_delivered_h2_is_tonnes_per_year(self):
+        rows = build_summary_rows(self.results)
+        ammonia = next(row for row in rows if row["Carrier"] == "Ammonia")
+        self.assertAlmostEqual(ammonia[DELIVERED_H2_LABEL], 243_780.1439852848)
+        self.assertAlmostEqual(ammonia[DELIVERED_COST_LABEL], 0.9783449698528076)
+
+    def test_cost_comparison_uses_independent_not_summed_values(self):
+        rows = {row["Carrier"]: row for row in build_cost_comparison_rows(self.results)}
+        self.assertAlmostEqual(rows["Ammonia"][SHIPPING_COST_LABEL], 0.35517114011570955)
+        self.assertAlmostEqual(rows["Ammonia"][DELIVERED_COST_LABEL], 0.9783449698528076)
+        self.assertNotAlmostEqual(rows["Ammonia"][DELIVERED_COST_LABEL], 0.35517114011570955 + 0.9783449698528076)
+        self.assertAlmostEqual(rows["Hydrogen"][SHIPPING_COST_LABEL], 0.7917431998583839)
+        self.assertAlmostEqual(rows["Hydrogen"][DELIVERED_COST_LABEL], 0.7917431998583839)
+
+    def test_lowest_delivered_cost_is_hydrogen(self):
+        cheapest = lowest_delivered_cost(self.results.values())
+        self.assertEqual(cheapest["carrier"], "Hydrogen")
+        self.assertAlmostEqual(cheapest["totals"]["delivered_transport_chain_cost_aud_per_kg_h2"], 0.7917431998583839)
 
     def test_sensitivity_ranges_are_ordered(self):
         specs = list(REFERENCE["sensitivity_parameters"])
@@ -147,7 +204,20 @@ class ModelTests(unittest.TestCase):
         hydrogen = sensitivity_analysis(carrier="Hydrogen")
         self.assertGreaterEqual(len(ammonia), 20)
         self.assertGreaterEqual(len(hydrogen), 15)
-        self.assertTrue(all("Base landed cost" in row for row in ammonia))
+        expected = {
+            "Shipping cost @ low input", "Shipping cost @ base input", "Shipping cost @ high input",
+            "Delivered cost @ low input", "Delivered cost @ base input", "Delivered cost @ high input",
+            "Delivered H2 (t/year) @ low input", "Delivered H2 (t/year) @ base input",
+            "Delivered H2 (t/year) @ high input",
+        }
+        self.assertTrue(all(expected.issubset(row) for row in ammonia))
+        self.assertTrue(all(not any("landed cost" in key.lower() for key in row) for row in ammonia))
+
+    def test_sensitivity_delivered_h2_is_tonnes_per_year(self):
+        rows = sensitivity_analysis(carrier="Ammonia")
+        aud_usd = next(row for row in rows if row["Parameter"] == "AUD/USD")
+        self.assertAlmostEqual(aud_usd["Delivered H2 (t/year) @ base input"], 243_780.1439852848)
+        self.assertLess(aud_usd["Delivered cost @ high input"], aud_usd["Delivered cost @ low input"])
 
     def test_heat_source_enters_energy_or_mass_balance(self):
         electric = self.results["Ammonia"]
@@ -157,11 +227,14 @@ class ModelTests(unittest.TestCase):
         self.assertGreater(gas["emissions_breakdown_tco2e"]["Ammonia cracking"], 0)
 
     def test_parameter_sources_have_required_metadata(self):
-        required = {"parameter", "base_value", "unit", "source", "year", "type", "range", "notes"}
+        required = {"parameter", "base_value", "unit", "source", "year", "type", "range", "notes", "citation_status"}
         allowed = {"Official data", "Literature value", "Engineering assumption", "Derived value", "Legacy workbook value"}
-        for row in REFERENCE["parameter_sources"]:
+        for row in metadata()["parameter_sources"]:
             self.assertTrue(required.issubset(row))
             self.assertIn(row["type"], allowed)
+        vague = [row for row in metadata()["parameter_sources"] if row["source"].startswith("Published ")]
+        self.assertTrue(vague)
+        self.assertTrue(all(row["citation_status"] == "Full citation to be verified" for row in vague))
 
     def test_default_regression_targets(self):
         for carrier, expected in REFERENCE["validation_targets"].items():

@@ -56,7 +56,7 @@ python -m compileall .
 ## 主要输出
 
 - Shipping cost：不含氨裂解成本，以理论氢当量为分母；
-- Post-cracking landed hydrogen cost：包含裂解成本，以最终交付氢为分母；
+- Delivered transport-chain cost：氨路线包含裂解成本，以最终交付氢为分母；氢路线不经过氨裂解；
 - Delivered medium和Delivered H2；
 - Transport-chain GHG emissions及各阶段分解；
 - Supplementary hydrogen-leakage impact；
