@@ -2,6 +2,8 @@
 from __future__ import annotations
 
 import math
+import subprocess
+import sys
 import unittest
 from pathlib import Path
 
@@ -162,10 +164,37 @@ class ModelTests(unittest.TestCase):
         self.assertIn("stack=False", app)
 
     def test_annual_mass_unit_conversions(self):
-        value = 1_000_000_000.0
-        self.assertEqual(kg_year_to_t_year(value), 1_000_000.0)
-        self.assertEqual(kg_year_to_kt_year(value), 1_000.0)
-        self.assertEqual(kg_year_to_mt_year(value), 1.0)
+        self.assertEqual(kg_year_to_t_year(1_000.0), 1.0)
+        self.assertEqual(kg_year_to_kt_year(1_000_000.0), 1.0)
+
+        value = 243_780_143.985
+        self.assertAlmostEqual(kg_year_to_t_year(value), 243_780.144, places=3)
+        self.assertAlmostEqual(kg_year_to_kt_year(value), 243.780, places=3)
+
+        self.assertEqual(kg_year_to_mt_year(1_000_000_000.0), 1.0)
+
+    def _assert_module_imports(self, module_name: str) -> None:
+        completed = subprocess.run(
+            [sys.executable, "-c", f"import {module_name}"],
+            cwd=Path(__file__).parent,
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        self.assertEqual(
+            completed.returncode,
+            0,
+            f"import {module_name} failed:\nstdout:\n{completed.stdout}\nstderr:\n{completed.stderr}",
+        )
+
+    def test_model_imports_in_fresh_interpreter(self):
+        self._assert_module_imports("model")
+
+    def test_presentation_imports_in_fresh_interpreter(self):
+        self._assert_module_imports("presentation")
+
+    def test_app_imports_in_fresh_interpreter(self):
+        self._assert_module_imports("app")
 
     def test_default_delivered_h2_card_is_kilotonne_per_year(self):
         medium, delivered_h2 = annual_quantity_metric_values(self.results["Ammonia"])
