@@ -361,7 +361,9 @@ def sensitivity_analysis(payload: dict[str, Any] | None = None, carrier: str = "
         raise ValueError("Unsupported carrier for sensitivity analysis")
     base_payload = copy.deepcopy(payload or {})
     base_payload["carriers"] = [carrier]
-    base_result = calculate_case(base_payload)["results"][0]
+    base_case = calculate_case(base_payload)
+    base_result = base_case["results"][0]
+    _, carrier_inputs = _validated_inputs(base_payload)
     specs = list(REFERENCE["sensitivity_parameters"])
     specs.extend(REFERENCE.get("carrier_sensitivity_parameters", {}).get(carrier, []))
     if carrier == "Hydrogen":
@@ -369,6 +371,11 @@ def sensitivity_analysis(payload: dict[str, Any] | None = None, carrier: str = "
         specs = [spec for spec in specs if spec["key"] not in excluded]
     rows: list[dict[str, Any]] = []
     for spec in specs:
+        base_input = (
+            carrier_inputs[carrier][spec["carrier_field"]]
+            if spec.get("carrier_field")
+            else base_case["inputs"][spec["key"]]
+        )
         outcomes: dict[str, dict[str, float]] = {}
         for level, value in (("Low", spec["low"]), ("High", spec["high"])):
             scenario = copy.deepcopy(base_payload)
@@ -385,7 +392,7 @@ def sensitivity_analysis(payload: dict[str, Any] | None = None, carrier: str = "
             }
         totals = base_result["totals"]
         rows.append({
-            "Parameter": spec["label"], "Low input": spec["low"], "Base input": spec["base"], "High input": spec["high"],
+            "Parameter": spec["label"], "Low input": spec["low"], "Base input": base_input, "High input": spec["high"],
             "Shipping cost @ low input": outcomes["Low"]["shipping"],
             "Shipping cost @ base input": totals["shipping_cost_aud_per_kg_h2"],
             "Shipping cost @ high input": outcomes["High"]["shipping"],

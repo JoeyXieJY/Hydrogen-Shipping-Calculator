@@ -248,6 +248,28 @@ class ModelTests(unittest.TestCase):
         self.assertAlmostEqual(aud_usd["Delivered H2 (t/year) @ base input"], 243_780.1439852848)
         self.assertLess(aud_usd["Delivered cost @ high input"], aud_usd["Delivered cost @ low input"])
 
+    def test_sensitivity_base_input_tracks_current_cracking_cost(self):
+        payload = {"cracking_cost_usd_per_kg_h2": 0.50, "carriers": ["Ammonia"]}
+        row = next(item for item in sensitivity_analysis(payload, "Ammonia") if item["Parameter"] == "Cracking cost")
+        current = calculate_case(payload)["results"][0]["totals"]
+
+        self.assertEqual(row["Base input"], 0.50)
+        self.assertAlmostEqual(row["Delivered cost @ base input"], current["delivered_transport_chain_cost_aud_per_kg_h2"])
+        self.assertAlmostEqual(row["Shipping cost @ base input"], current["shipping_cost_aud_per_kg_h2"])
+        self.assertEqual((row["Low input"], row["High input"]), (0.20, 0.80))
+
+        source = next(item for item in metadata()["parameter_sources"] if item["parameter"] == "Cracking cost")
+        self.assertEqual(source["base_value"], 0.35)
+        self.assertEqual(source["range"], "0.20–0.80")
+
+    def test_sensitivity_base_input_tracks_carrier_override(self):
+        payload = {"carrier_overrides": {"Ammonia": {"transport_bog_pct_day": 0.07}}}
+        row = next(item for item in sensitivity_analysis(payload, "Ammonia") if item["Parameter"] == "NH3 shipping BOG")
+        current = calculate_case(payload)["results"][0]["totals"]
+
+        self.assertEqual(row["Base input"], 0.07)
+        self.assertAlmostEqual(row["Delivered cost @ base input"], current["delivered_transport_chain_cost_aud_per_kg_h2"])
+
     def test_heat_source_enters_energy_or_mass_balance(self):
         electric = self.results["Ammonia"]
         process_h2 = calculate_case({"carriers": ["Ammonia"], "cracking_heat_source": "Process hydrogen/off-gas"})["results"][0]

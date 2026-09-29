@@ -71,3 +71,24 @@ def test_voyage_factor_updates_effective_voyage_and_sailings() -> None:
     metrics = {metric.label: metric.value for metric in app.metric}
     assert metrics["Effective voyage"] == "8.44 days"
     assert metrics["Annual sailings"] == "17.60"
+
+
+def test_edited_cracking_cost_updates_sensitivity_base_input_and_scenario() -> None:
+    app = AppTest.from_file("app.py", default_timeout=30).run()
+    cost = next(widget for widget in app.number_input if widget.label == "Cracking cost (USD/kg H₂)")
+    cost.set_value(0.50)
+    next(button for button in app.button if button.label == "Calculate").click()
+    app.run()
+    assert not app.exception
+
+    summary = app.dataframe[0].value
+    ammonia_cost = summary.loc[summary["Carrier"] == "Ammonia", DELIVERED_COST_LABEL].iloc[0]
+    sensitivity = next(frame.value for frame in app.dataframe if "Base input" in frame.value.columns)
+    row = sensitivity.loc[sensitivity["Parameter"] == "Cracking cost"].iloc[0]
+    assert row["Base input"] == 0.50
+    assert abs(row["Delivered cost @ base input"] - ammonia_cost) < 1e-10
+
+    sources = next(frame.value for frame in app.dataframe if "base_value" in frame.value.columns)
+    source = sources.loc[sources["parameter"] == "Cracking cost"].iloc[0]
+    assert source["base_value"] == "0.35"
+    assert source["range"] == "0.20–0.80"
