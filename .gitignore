@@ -3,6 +3,7 @@
 venv/
 __pycache__/
 *.py[cod]
+.pytest_cache/
 
 # Local secrets and credentials
 .env
@@ -14,6 +15,8 @@ __pycache__/
 credentials.*
 secrets.toml
 .streamlit/secrets.toml
+*.zip
+*.log
 
 # Original spreadsheet source files
 *.xlsx

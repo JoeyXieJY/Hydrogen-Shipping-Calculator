@@ -8,7 +8,7 @@ from model import kg_year_to_kt_year, kg_year_to_t_year
 
 
 SHIPPING_COST_LABEL = "Shipping cost (A$/kg H₂-eq)"
-DELIVERED_COST_LABEL = "Delivered transport-chain cost (A$/kg H₂)"
+DELIVERED_COST_LABEL = "Delivered transport-chain cost (A$/kg H2)"
 DELIVERED_H2_LABEL = "Delivered H₂ (t/year)"
 
 

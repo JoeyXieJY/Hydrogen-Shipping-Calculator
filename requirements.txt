@@ -1,3 +1,4 @@
-streamlit>=1.41,<2
-pandas>=2.0,<3
+streamlit>=1.57,<1.65
+pandas>=2.2,<3
+pyarrow>=20,<26
 pytest>=8,<10

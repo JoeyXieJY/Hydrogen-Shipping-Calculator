@@ -17,24 +17,19 @@ REFERENCE = json.loads(DATA_PATH.read_text(encoding="utf-8"))
 KNOT_TO_KM_PER_HOUR = 1.852
 GWP100_CH4 = 28.0
 GWP100_N2O = 265.0
-KG_PER_TONNE = 1_000.0
-KG_PER_KILOTONNE = 1_000_000.0
-KG_PER_MEGATONNE = 1_000_000_000.0
-
-
 def kg_year_to_t_year(value: float) -> float:
     """Convert an annual mass flow from kg/year to t/year."""
-    return value / KG_PER_TONNE
+    return value / 1_000
 
 
 def kg_year_to_kt_year(value: float) -> float:
     """Convert an annual mass flow from kg/year to kt/year."""
-    return value / KG_PER_KILOTONNE
+    return value / 1_000_000
 
 
 def kg_year_to_mt_year(value: float) -> float:
     """Convert an annual mass flow from kg/year to Mt/year."""
-    return value / KG_PER_MEGATONNE
+    return value / 1_000_000_000
 
 
 def _num(value: Any, name: str, low: float | None = None, high: float | None = None) -> float:

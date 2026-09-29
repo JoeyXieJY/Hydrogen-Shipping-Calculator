@@ -40,7 +40,7 @@ st.markdown(
     }
     div[data-testid="stMetricValue"] p {
         font-size:clamp(.9rem,1.35vw,1.65rem)!important;
-        white-space:nowrap!important;overflow-wrap:normal;
+        white-space:normal!important;overflow-wrap:anywhere;
     }
     .section-title {font-size:1.4rem;font-weight:800;margin:0 0 .8rem;color:#142329;}
     .section-number {color:#0b7a59;margin-right:.55rem;}
